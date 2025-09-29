@@ -1,28 +1,5 @@
 "Energy Price Forecasting"
 
-Project_root/
-├─ data/
-│  ├─ raw/
-│  │  └─ raw_database.parquet
-│  ├─ processed/
-│  │  └─ ready_database.parquet
-│  └─ merged predictions/
-│     └─ merged_predictions.csv
-│
-├─ src/
-│  ├─ 1.preprocessing/
-│  │  ├─ Clean preprocessing pipeline for energy-price time series.py
-│  ├─ 2.models/
-│  │  ├─ Transformer Forecasting Pipeline.py
-│  │  ├─ Walk-forward forecasting pipeline.py
-│  └─ 3.tests/
-│     ├─ Aggregate and visualize feature rankings.py
-│     ├─ Evaluation & visualization pipeline for model forecasts.py
-│
-├─ requirements.txt
-├─ README.md
-└─ .gitignore
-
 1) Clean preprocessing pipeline for energy-price time series
   Loads hourly parquet with a datetime column, builds a leak-safe feature set, drops zero-variance and highly correlated columns, imputes with IterativeImputer(RandomForest), optional stationarity tests, and STL plot. Saves a clean table.
   Input:
