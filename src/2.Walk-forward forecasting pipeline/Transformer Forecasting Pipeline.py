@@ -1,957 +1,1061 @@
 # -*- coding: utf-8 -*-
 """
-Transformer Forecasting Pipeline
+Scope
+- Loads a prepared feature table with a datetime index.
+- Evaluates models with walk-forward time-series cross-validation (fixed 7-day horizon by default).
+- Reports MAE, RMSE, MAPE, RMSLE, R²; saves a ranked CSV; draws last-fold plots.
+- Provide feature importance helpers (GBR/XGB) and residual diagnostics.
+- Include a robust SARIMA/SARIMAX wrapper with safe fallback and hybrid option.
 
-This module provides a production-style pipeline for training a Transformer-based
-regressor on hourly time series, computing permutation feature importance on the
-latest horizon, and producing a forward forecast.
-
-Key features:
-1) Data loading & preparation from Parquet
-2) Optional Optuna hyperparameter tuning with TimeSeriesSplit CV.
-3) Transformer model with:
-   - signed_log1p target transform + StandardScaler
-   - sliding "lookback" windows
-   - causal attention mask
-   - hour-of-day & day-of-week embeddings
-   - early stopping on MAE in the original scale
-4) Permutation feature importance on the last H hours (keeps proper lookback context).
-5) Refit on the full dataset and forecast the next H hours to CSV.
-
-Outputs (under results directory):
-- best_optuna_config.json (if tuning enabled)
-- training_config_used.json (config actually used for training/forecast)
-- perm_importance_lastH_top20.csv (if feasible)
-- forecast_h{H}.csv (timestamp, prediction)
+Outputs
+- results/ranking_models.csv
+- results/plot_LAST_FOLD_ALL.png
+- results/plot_LAST_FOLD_<MODEL>.png
+- results/gbr_top_features.csv, results/xgb_top_features.csv
 """
-
 from __future__ import annotations
 
+import copy
 import os
-import math
-import json
+import gc
 import warnings
-from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Dict, Tuple, List, Optional
-
+from types import SimpleNamespace
+from typing import Dict, List, Optional, Tuple
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-
-from sklearn.model_selection import TimeSeriesSplit
+import xgboost as xgb
+from sklearn.base import BaseEstimator, RegressorMixin
+from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import RandomizedSearchCV, TimeSeriesSplit
+from statsmodels.tsa.statespace.sarimax import SARIMAX
 
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import TensorDataset, DataLoader
+# ========================= PATHS =========================
 
-warnings.filterwarnings("ignore")
-
-TARGET_COLUMN = "fixing_i_price"
-DEFAULT_DATA = "raw_database.parquet"
-
-# Defaults for Optuna
-TUNE_WITH_OPTUNA_DEFAULT = True
-OPTUNA_TRIALS_DEFAULT = 40
-
-# Model training enhancements
-SNAPSHOT_TOP_K_DEFAULT = 3
-EMA_DECAY_DEFAULT = 0.999
-MC_DROPOUT_PASSES_DEFAULT = 1
-FEATURE_NOISE_STD_DEFAULT = 0.01
-
-# Presets
-BEST_CFG = dict(
-    embed_dim=256,
-    nhead=8,
-    num_layers=6,
-    ff_dim=512,
-    dropout=0.15,
-    batch_size=32,
-    epochs=130,
-    lr=5e-4,
-    weight_decay=1e-5,
-    lookback=336,            # 14 days of hourly history
-    patience=30,
-    aggregation="last",
-    amp=True
-)
-
-TUNED_CFG = dict(
-    embed_dim=192, nhead=8, num_layers=5, ff_dim=768,
-    dropout=0.09643232167672024, batch_size=32, epochs=130,
-    lr=0.00014255116408297153, weight_decay=2.3140733126148502e-05,
-    lookback=336, patience=20, aggregation="last", amp=True
-)
-
-
-@dataclass
-class RunConfig:
-    """High-level pipeline configuration."""
-    data_path: str = DEFAULT_DATA
-    results_dir: Path = Path("results_transformer")
-    forecast_h: int = 7 * 24  # 7 days of hourly forecast
-    tune_with_optuna: bool = TUNE_WITH_OPTUNA_DEFAULT
-    optuna_trials: int = OPTUNA_TRIALS_DEFAULT
-    cv_splits: int = 3
-    seed: int = 42
-
-    def ensure_dirs(self) -> None:
-        self.results_dir.mkdir(parents=True, exist_ok=True)
-
-
-# Utilities
-
-def _optuna_available() -> bool:
+def bootstrap_paths_models() -> SimpleNamespace:
+    """Locate project root (having data/processed) and prep results paths."""
     try:
-        import optuna  # noqa: F401
-        return True
-    except Exception:
-        return False
+        here = Path(__file__).resolve()
+    except NameError:
+        here = Path.cwd().resolve()
+
+    root = None
+    for p in [here] + list(here.parents):
+        if (p / "data" / "processed").exists():
+            root = p
+            break
+
+    if root is None:
+        env = os.environ.get("PROJECT_ROOT")
+        if env and (Path(env) / "data" / "processed").exists():
+            root = Path(env).resolve()
+
+    if root is None:
+        root = here.parent.parent
+
+    data = root / "data"
+    processed = data / "processed"
+    results = root / "results"
+    results.mkdir(parents=True, exist_ok=True)
+
+    return SimpleNamespace(
+        project_root=root,
+        data_dir=data,
+        processed_dir=processed,
+        results_dir=results,
+    )
 
 
-def set_global_seed(seed: int = 42) -> None:
-    """Set seeds for reproducibility (keeps CuDNN autotune)."""
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.use_deterministic_algorithms(False)
-    torch.backends.cudnn.benchmark = True
+PATHS = bootstrap_paths_models()
+PROJECT_ROOT = PATHS.project_root
+DATA_PROCESSED = PATHS.processed_dir
+RESULTS_DIR = PATHS.results_dir
+
+FEATURES_FILE = DATA_PROCESSED / "ready_database.parquet"
+TARGET_COLUMN = "fixing_i_price"
+DATETIME_COLUMN_NAME = "datetime"
+
+DROP_EXOG_FEATURES = {
+     "co2_objetosc", "gaz_objetosc",
+     "season_summer", "hour", "month",
+     "season_spring", "season_winter",
+     "kurs_eur_pln","kurs_usd_pln",
+}
+
+# Multi-horizon setup
+HORIZON_DAYS = [1,7,14,31]
+HORIZONS_HOURS = [d * 24 for d in HORIZON_DAYS]
+
+# Validation tests
+DEFAULT_TEST_HORIZON = 24 * 7
+DEFAULT_N_SPLITS = 5
 
 
-def signed_log1p(x: np.ndarray | pd.Series) -> np.ndarray:
-    x = np.asarray(x, dtype=np.float32)
-    return np.sign(x) * np.log1p(np.abs(x))
+# ========================= DATA =========================
+
+def load_features_table(path: Path, datetime_column: str = DATETIME_COLUMN_NAME) -> pd.DataFrame:
+    """Load Parquet/CSV by extension; ensure datetime index and hourly frequency.
+    On failure, return empty DataFrame and continue gracefully.
+    """
+    if not path.exists():
+        print(f"[WARN] Feature table not found: {path}")
+        return pd.DataFrame()
+
+    try:
+        if path.suffix.lower() == ".parquet":
+            df = pd.read_parquet(path)
+        elif path.suffix.lower() == ".csv":
+            df = pd.read_csv(path)
+        else:
+            print(f"[WARN] Unsupported extension '{path.suffix}'. Expected .parquet or .csv")
+            return pd.DataFrame()
+    except Exception as exc:
+        print(f"[WARN] Failed to read {path}: {exc}")
+        return pd.DataFrame()
+
+    if datetime_column in df.columns:
+        df[datetime_column] = pd.to_datetime(df[datetime_column], errors="coerce")
+        df = df.dropna(subset=[datetime_column]).set_index(datetime_column)
+
+    if not isinstance(df.index, pd.DatetimeIndex):
+        print("[WARN] Feature table must have a datetime index or a 'datetime' column.")
+        return pd.DataFrame()
+
+    df = df.sort_index().asfreq("h")
+    df = df.dropna(how="any")
+    print(f"[INFO] Using features file: {path} -> {len(df):,} rows x {df.shape[1]} cols")
+    return df
 
 
-def inv_signed_log1p(x: np.ndarray | pd.Series) -> np.ndarray:
-    x = np.asarray(x, dtype=np.float32)
-    return np.sign(x) * np.expm1(np.abs(x))
+# ========================= CONTEXT & METRICS =========================
+
+class RunContext:
+    """Holds last-fold series and aggregate metrics for a run."""
+    def __init__(self):
+        self.last_fold: Optional[Tuple[pd.Series, Dict[str, pd.Series]]] = None
+        self.all_results: List[Dict] = []
+        self.preds_by_model: Dict[str, pd.Series] = {}
+        self.full_series: Optional[pd.Series] = None
 
 
 class Metrics:
-    """NaN-safe metrics for convenience."""
     @staticmethod
-    def mae(y_true: pd.Series, y_pred: pd.Series | np.ndarray) -> float:
-        y_pred = pd.Series(y_pred, index=y_true.index)
-        mask = ~np.isnan(y_pred.values)
-        if mask.sum() == 0:
-            return np.nan
-        return float(mean_absolute_error(y_true[mask], y_pred[mask]))
+    def mae(y_true, y_pred):
+        return mean_absolute_error(y_true, y_pred)
 
     @staticmethod
-    def rmse(y_true: pd.Series, y_pred: pd.Series | np.ndarray) -> float:
-        y_pred = pd.Series(y_pred, index=y_true.index)
-        mask = ~np.isnan(y_pred.values)
-        if mask.sum() == 0:
-            return np.nan
-        return float(np.sqrt(mean_squared_error(y_true[mask], y_pred[mask])))
+    def rmse(y_true, y_pred):
+        return np.sqrt(mean_squared_error(y_true, y_pred))
 
     @staticmethod
-    def mape(y_true: pd.Series, y_pred: pd.Series | np.ndarray, eps: float = 1e-8) -> float:
-        y_pred = pd.Series(y_pred, index=y_true.index)
-        mask = (~np.isnan(y_pred.values)) & (np.abs(y_true.values) >= eps)
-        if mask.sum() == 0:
-            return np.nan
-        return float(np.mean(np.abs((y_true.values[mask] - y_pred.values[mask]) / y_true.values[mask])) * 100.0)
+    def mape(y_true, y_pred, eps: float = 1e-9):
+        tv = np.asarray(y_true, dtype=float)
+        pv = np.asarray(y_pred, dtype=float)
+        denom = np.clip(np.abs(tv), eps, None)
+        return np.mean(np.abs(tv - pv) / denom) * 100.0
 
     @staticmethod
-    def r2(y_true: pd.Series, y_pred: pd.Series | np.ndarray) -> float:
-        y_pred = pd.Series(y_pred, index=y_true.index)
-        mask = ~np.isnan(y_pred.values)
-        if mask.sum() <= 1:
-            return np.nan
-        return float(r2_score(y_true.values[mask], y_pred.values[mask]))
+    def rmsle(y_true, y_pred, eps: float = 1e-9):
+        tv = np.maximum(np.asarray(y_true, dtype=float), 0.0)
+        pv = np.maximum(np.asarray(y_pred, dtype=float), 0.0)
+        return np.sqrt(np.mean((np.log1p(pv + eps) - np.log1p(tv + eps)) ** 2))
+
+    @staticmethod
+    def r2(y_true, y_pred):
+        return r2_score(y_true, y_pred)
 
 
-# Data Module
+# === ANALYSIS TOOLS (validation, saving, multi-horizon, recursive blocks) ===
 
-class DataModule:
-    """Data loading, calendar features, and future feature generation."""
+class AnalysisTools:
+    """Utilities for validation, saving outputs and multi-horizon orchestration"""
+    @staticmethod
+    def validate_time_series_model(
+        input_df: pd.DataFrame,
+        target_column: str,
+        model_obj,
+        test_horizon: int = DEFAULT_TEST_HORIZON,
+        n_splits: int = DEFAULT_N_SPLITS,
+        model_name: str = "",
+        print_results: bool = True,
+        run_context: Optional[RunContext] = None,
+    ) -> np.ndarray:
+        """Walk-forward CV with fixed test horizon. Returns metrics [MAE, RMSE, MAPE, RMSLE, R2]."""
+        name = model_name or model_obj.__class__.__name__
+        rc = run_context or RunContext()
 
-    def __init__(self, target_col: str = TARGET_COLUMN) -> None:
-        self.target_col = target_col
+        if input_df is None or input_df.empty:
+            print(f"[SKIP] {name}: empty input table.")
+            return np.array([np.nan] * 5)
 
-    def load_dataframe(self, data_uri: str) -> pd.DataFrame:
-        """
-        Load Parquet (local). Require DatetimeIndex (or 'datetime'/'timestamp' column).
-        Enforce hourly frequency, forward-fill, and drop zero-variance columns.
-        """
-        df = pd.read_parquet(data_uri)
+        need_rows = test_horizon * (n_splits + 1)
+        if len(input_df) <= need_rows:
+            print(f"[SKIP] {name}: not enough rows for {n_splits} splits of {test_horizon}h.")
+            return np.array([np.nan] * 5)
 
-        if not isinstance(df.index, pd.DatetimeIndex):
-            if "datetime" in df.columns:
-                df["datetime"] = pd.to_datetime(df["datetime"])
-                df = df.set_index("datetime")
-            elif "timestamp" in df.columns:
-                df["timestamp"] = pd.to_datetime(df["timestamp"])
-                df = df.set_index("timestamp")
+        tscv = TimeSeriesSplit(n_splits=n_splits, test_size=test_horizon)
+        metrics_rows: List[List[float]] = []
+
+        def _update_last_fold(y_true: pd.Series, y_pred: np.ndarray) -> None:
+            pred_s = pd.Series(y_pred, index=y_true.index, name=name)
+            if rc.last_fold is None:
+                rc.last_fold = (y_true.copy(), {name: pred_s})
+                return
+            y_ref, prev = rc.last_fold
+            common_idx = y_ref.index.intersection(y_true.index)
+            if len(common_idx) == 0:
+                rc.last_fold = (y_true.copy(), {name: pred_s})
+                return
+            y_ref = y_ref.loc[common_idx]
+            prev = {k: v.reindex(common_idx) for k, v in prev.items()}
+            prev[name] = pred_s.reindex(common_idx)
+            rc.last_fold = (y_ref, prev)
+
+        for idx_tr, idx_te in tscv.split(input_df):
+            train_df = input_df.iloc[idx_tr]
+            test_df = input_df.iloc[idx_te]
+
+            X_tr = train_df.drop(columns=[target_column])
+            y_tr = train_df[target_column]
+            X_te = test_df.drop(columns=[target_column])
+            y_te = test_df[target_column]
+
+            model_obj.fit(X_tr, y_tr)
+            y_pred = model_obj.predict(X_te)
+
+            if len(y_pred) == len(y_te):
+                rc.preds_by_model[name] = pd.Series(y_pred, index=y_te.index)
+                _update_last_fold(y_te, y_pred)
+
+            mae = Metrics.mae(y_te, y_pred)
+            rmse = Metrics.rmse(y_te, y_pred)
+            mape = Metrics.mape(y_te, y_pred)
+            rmsle = Metrics.rmsle(y_te, y_pred)
+            r2 = Metrics.r2(y_te, y_pred)
+            metrics_rows.append([mae, rmse, mape, rmsle, r2])
+
+        mean_vals = np.array(metrics_rows).mean(axis=0)
+
+        if print_results:
+            print(f"\nValidation - {name} (h={test_horizon}h)")
+            print(f"MAE   : {mean_vals[0]:8.2f}")
+            print(f"RMSE  : {mean_vals[1]:8.2f}")
+            print(f"MAPE  : {mean_vals[2]:8.2f} %")
+            print(f"RMSLE : {mean_vals[3]:8.4f}")
+            print(f"R2    : {mean_vals[4]:8.4f}")
+
+        rc.all_results.append(dict(
+            model=name,
+            HorizonHours=test_horizon,
+            MAE=mean_vals[0],
+            RMSE=mean_vals[1],
+            MAPE=mean_vals[2],
+            RMSLE=mean_vals[3],
+            R2=mean_vals[4],
+        ))
+        return mean_vals
+
+    @staticmethod
+    def plot_forecast_vs_observed(
+        y_observed: pd.Series,
+        y_pred: pd.Series,
+        model_name: str,
+        *,
+        title_prefix: str = "Forecast vs Observed (last fold)",
+        save_path: Optional[Path] = None,
+    ) -> Dict[str, float]:
+        mae = Metrics.mae(y_observed, y_pred)
+        rmse = Metrics.rmse(y_observed, y_pred)
+        mape = Metrics.mape(y_observed, y_pred)
+
+        plt.figure(figsize=(12, 4))
+        plt.plot(y_observed, label="Observed", linewidth=2, color="black")
+        plt.plot(
+            y_pred,
+            "--",
+            label=f"{model_name}  MAE={mae:.2f} | RMSE={rmse:.2f} | MAPE={mape:.2f}%",
+        )
+        plt.title(f"{title_prefix} – {model_name}")
+        plt.legend()
+        plt.tight_layout()
+        if save_path is not None:
+            plt.savefig(save_path, dpi=120)
+            plt.close()
+        else:
+            plt.show()
+        return {"MAE": mae, "RMSE": rmse, "MAPE": mape}
+
+    @staticmethod
+    def run_recursive_blocks(
+        models: Dict[str, BaseEstimator],
+        features_dataframe: pd.DataFrame,
+        target_column: str,
+        sarima_dataset: pd.DataFrame,
+        sarimax_dataset: Optional[pd.DataFrame],
+        block_hours: int = 24 * 7,
+        n_blocks: int = 10,
+        save_csv_path: Path = RESULTS_DIR / "recursive_blocks_h168x10_ML.csv",
+        run_context: Optional[RunContext] = None,
+    ) -> pd.DataFrame:
+        """Train/predict in fixed-size blocks over the tail window; merge blocks and score on a common horizon"""
+        rc = run_context or RunContext()
+
+        total_hours = block_hours * n_blocks
+        if len(features_dataframe) <= total_hours:
+            raise ValueError(
+                f"Not enough data for {n_blocks} blocks of {block_hours}h (need > {total_hours} rows)."
+            )
+
+        eval_index = features_dataframe.index[-total_hours:]
+        start_idx = len(features_dataframe) - total_hours
+        block_bounds = [
+            (start_idx + i * block_hours, start_idx + (i + 1) * block_hours)
+            for i in range(n_blocks)
+        ]
+
+        y_obs_full = features_dataframe.loc[eval_index, target_column].astype(float)
+        predictions: Dict[str, pd.Series] = {}
+        ranking_rows: List[Dict] = []
+
+        for name, model_object in models.items():
+            if name == "SARIMAX":
+                input_df = sarimax_dataset
+            elif name == "SARIMA":
+                input_df = sarima_dataset
             else:
-                raise ValueError("Parquet must contain DatetimeIndex or 'datetime'/'timestamp' column")
+                input_df = features_dataframe
 
-        df = df.asfreq("H")
-        df = df.dropna(subset=[self.target_col]).fillna(method="ffill")
+            if input_df is None or input_df.empty or target_column not in input_df.columns:
+                print(f"[SKIP] {name}: input missing or no '{target_column}'")
+                continue
 
-        constant_cols = [c for c in df.columns if df[c].nunique() <= 1]
-        if constant_cols:
-            print("Removing zero-variance columns:", constant_cols)
-            df = df.drop(columns=constant_cols)
-        return df
+            preds_full: List[pd.Series] = []
+            for block_id, (b_start, b_end) in enumerate(block_bounds, start=1):
+                train = input_df.iloc[:b_start]
+                test = input_df.iloc[b_start:b_end]
 
-    @staticmethod
-    def _calendar_from_index(idx: pd.DatetimeIndex) -> Dict[str, np.ndarray]:
-        hour = idx.hour.values
-        dow = idx.dayofweek.values
-        month = idx.month.values
-        weekend = (dow >= 5).astype(int)
-        rad = 2 * np.pi
-        sin24 = np.sin(rad * (hour / 24.0));  cos24 = np.cos(rad * (hour / 24.0))
-        sin168 = np.sin(rad * ((dow * 24 + hour) / 168.0));  cos168 = np.cos(rad * ((dow * 24 + hour) / 168.0))
-        quarter = ((month - 1) // 3 + 1).astype(int)
-        return dict(hour=hour, day_of_week=dow, month=month, weekend=weekend,
-                    sin24=sin24, cos24=cos24, sin168=sin168, cos168=cos168, quarter=quarter)
+                if len(test) != block_hours or len(train) == 0:
+                    print(f"[{name}] Skip block {block_id}: train={len(train)} test={len(test)}")
+                    continue
 
-    def ensure_calendar_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        cal = self._calendar_from_index(df.index)
-        for k, v in cal.items():
-            if k not in df.columns:
-                df[k] = v
-        return df
+                X_tr = train.drop(columns=[target_column])
+                y_tr = train[target_column].astype(float)
+                X_te = test.drop(columns=[target_column])
 
-    def make_future_features_like_train(self, train_df: pd.DataFrame, horizon_h: int) -> pd.DataFrame:
-        """
-        Build a future feature frame with the same columns as training X (train_df without target).
-        - Calendar features are recomputed from the future index.
-        - All other features are forward-filled with their last observed values.
-        """
-        last_ts = train_df.index.max()
-        idx_future = pd.date_range(last_ts + pd.Timedelta(hours=1), periods=horizon_h, freq="H")
-        X_hist = train_df.drop(columns=[self.target_col])
-        X_future = pd.DataFrame(index=idx_future, columns=X_hist.columns, dtype=float)
+                try:
+                    model_object.fit(X_tr, y_tr)
+                    y_block = pd.Series(
+                        model_object.predict(X_te), index=X_te.index, name=name
+                    ).astype(float)
+                except Exception as e:
+                    print(f"[ERROR] {name} block {block_id}: {e!s}")
+                    y_block = pd.Series(
+                        [np.nan] * len(X_te), index=X_te.index, name=name
+                    )
+                preds_full.append(y_block)
 
-        cal = self._calendar_from_index(idx_future)
-        for col in X_future.columns:
-            if col in cal:
-                X_future[col] = cal[col]
+            if not preds_full:
+                print(f"[WARN] {name}: no blocks produced.")
+                continue
+
+            pred_series = pd.concat(preds_full).sort_index().reindex(eval_index)
+            predictions[name] = pred_series
+
+            yt, yp = y_obs_full.align(pred_series, join="inner")
+            mask = yt.notna() & yp.notna()
+            if mask.any():
+                mae = Metrics.mae(yt[mask].values, yp[mask].values)
+                rmse = Metrics.rmse(yt[mask].values, yp[mask].values)
+                mape = Metrics.mape(yt[mask].values, yp[mask].values)
+                print(
+                    f"[RECURSIVE] {name}: MAE={mae:.2f}  RMSE={rmse:.2f}  MAPE={mape:.2f}%  over {mask.sum()} points"
+                )
+                ranking_rows.append(dict(model=name, MAE=mae, RMSE=rmse, MAPE=mape))
+                rc.all_results.append(
+                    dict(
+                        model=name,
+                        HorizonHours=total_hours,
+                        MAE=mae,
+                        RMSE=rmse,
+                        MAPE=mape,
+                        RMSLE=np.nan,
+                        R2=np.nan,
+                    )
+                )
             else:
-                X_future[col] = float(X_hist[col].iloc[-1])
-        return X_future
+                print(f"[RECURSIVE] {name}: no valid points to score.")
 
+            try:
+                if hasattr(model_object, "model_") and model_object.model_ is not None:
+                    try:
+                        if hasattr(model_object.model_, "remove_data"):
+                            model_object.model_.remove_data()
+                    except Exception:
+                        pass
+                    model_object.model_ = None
+                if hasattr(model_object, "fallback_mean_value"):
+                    model_object.fallback_mean_value = None
+                if hasattr(model_object, "use_fallback"):
+                    model_object.use_fallback = False
+            except Exception:
+                pass
 
-# Model
+        out_df = pd.DataFrame({"Observed": y_obs_full})
+        for name, pred in predictions.items():
+            out_df[name] = pred.reindex(out_df.index)
 
-def _make_causal_mask(L: int, device: torch.device) -> torch.Tensor:
-    return torch.triu(torch.ones(L, L, device=device) * float("-inf"), diagonal=1)
+        save_csv_path.parent.mkdir(parents=True, exist_ok=True)
+        out_df.to_csv(save_csv_path, index_label="timestamp", float_format="%.6f")
+        print(f"[SAVE] Recursive blocks -> {save_csv_path}")
 
+        if ranking_rows:
+            rank_df = pd.DataFrame(ranking_rows).sort_values("MAE").reset_index(drop=True)
+            rank_path = RESULTS_DIR / "ranking_recursive_blocks_ML.csv"
+            rank_df.to_csv(rank_path, index=False)
+            print("[RANK] Recursive blocks ranking")
+            print(
+                rank_df.to_string(
+                    index=False,
+                    formatters={
+                        "MAE": "{:.2f}".format,
+                        "RMSE": "{:.2f}".format,
+                        "MAPE": "{:.2f}".format,
+                    },
+                )
+            )
+            print(f"[SAVE] {rank_path}")
 
-class PositionalEncoding(nn.Module):
-    """Standard sinus/cos positional encoding."""
-    def __init__(self, d_model: int, max_len: int = 20000) -> None:
-        super().__init__()
-        pe = torch.zeros(max_len, d_model, dtype=torch.float32)
-        pos = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)
-        div = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float32) * (-math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(pos * div)
-        pe[:, 1::2] = torch.cos(pos * div)
-        self.register_buffer("pe", pe.unsqueeze(0))  # (1, L, D)
+        try:
+            plt.figure(figsize=(12, 4))
+            plt.plot(out_df.index, out_df["Observed"].values, label="Observed", linewidth=2, color="black")
+            for name in predictions.keys():
+                plt.plot(out_df.index, out_df[name].values, label=name, alpha=0.9)
+            plt.title(f"Recursive block forecasts – {n_blocks}×{block_hours}h")
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(RESULTS_DIR / f"plot_recursive_blocks_h{block_hours}x{n_blocks}_ML.png", dpi=120)
+            plt.close()
+        except Exception:
+            pass
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x + self.pe[:, :x.size(1), :]
-
-
-class SeqTransformerRegressor(nn.Module):
-    """
-    Sequence-to-regression model for hourly time series.
-
-    Pipeline:
-    - y -> signed_log1p -> StandardScaler
-    - X -> StandardScaler
-    - sliding lookback windows
-    - causal Transformer encoder with positional + temporal embeddings
-    - 'last' (default) or 'mean' token aggregation
-    """
-
-    def __init__(
-        self,
-        embed_dim: int = 256,
-        nhead: int = 8,
-        num_layers: int = 6,
-        ff_dim: int = 512,
-        dropout: float = 0.10,
-        batch_size: int = 32,
-        epochs: int = 130,
-        lr: float = 5e-4,
-        weight_decay: float = 1e-5,
-        lookback: int = 336,
-        patience: int = 30,
-        aggregation: str = "last",
-        amp: bool = True,
-        device: Optional[str] = None
-    ) -> None:
-        super().__init__()
-        self.embed_dim = embed_dim
-        self.nhead = nhead
-        self.num_layers = num_layers
-        self.ff_dim = ff_dim
-        self.dropout = dropout
-        self.batch_size = batch_size
-        self.epochs = epochs
-        self.lr = lr
-        self.weight_decay = weight_decay
-        self.lookback = lookback
-        self.patience = patience
-        self.aggregation = aggregation.lower()
-        self.amp = amp
-
-        if self.aggregation not in {"last", "mean"}:
-            raise ValueError("aggregation must be 'last' or 'mean'")
-
-        self.device = torch.device(device if device else ("cuda" if torch.cuda.is_available() else "cpu"))
-
-        # To be initialized in fit()
-        self.input_proj: Optional[nn.Linear] = None
-        self.pos_enc: Optional[PositionalEncoding] = None
-        self.encoder: Optional[nn.TransformerEncoder] = None
-        self.final_norm: Optional[nn.LayerNorm] = None
-        self.output_proj: Optional[nn.Linear] = None
-
-        self.scaler_X: Optional[StandardScaler] = None
-        self.scaler_y: Optional[StandardScaler] = None
-
-        self._epochs_run: int = 0
-        self._best_epoch: int = 0
-        self._best_val_mae_orig: float = float("inf")
-        self.fitted: bool = False
-
-        # Causal mask cache (CPU)
-        self._causal_mask_cpu = _make_causal_mask(self.lookback, torch.device("cpu"))
-
-        # Temporal embeddings
-        self.hour_emb = nn.Embedding(24, self.embed_dim).to(self.device)
-        self.dow_emb = nn.Embedding(7, self.embed_dim).to(self.device)
-        self.time_proj = nn.Linear(self.embed_dim * 3, self.embed_dim).to(self.device)
-
-        # EMA + snapshots
-        self.use_ema: bool = True
-        self.ema_decay: float = EMA_DECAY_DEFAULT
-        self._ema_state: Optional[dict[str, torch.Tensor]] = None
-        self.snapshot_top_k: int = SNAPSHOT_TOP_K_DEFAULT
-        self._snapshots: List[Tuple[float, dict[str, torch.Tensor]]] = []
-
-        # Inference/training helpers
-        self.mc_dropout_passes: int = MC_DROPOUT_PASSES_DEFAULT
-        self.feature_noise_std: float = FEATURE_NOISE_STD_DEFAULT
-
-    # helpers (windows & temporal indices)
-    def _build_windows(self, X: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        L = self.lookback
-        if len(X) < L:
-            raise ValueError(f"Series shorter than lookback={L}")
-        X_win = np.lib.stride_tricks.sliding_window_view(X, window_shape=(L, X.shape[1]))
-        X_win = X_win.reshape(-1, L, X.shape[1])
-        y_trim = y[L - 1:]
-        return X_win, y_trim
+        return out_df
 
     @staticmethod
-    def _time_indices(index: pd.DatetimeIndex) -> Tuple[np.ndarray, np.ndarray]:
-        hours = index.hour.values.astype(np.int64)
-        dows = index.dayofweek.values.astype(np.int64)
-        return hours, dows
+    def save_horizon_outputs(
+        horizon_hours: int,
+        y_true: pd.Series,
+        preds: Dict[str, pd.Series],
+    ) -> Path:
+        """Save last-fold predictions for a given horizon to CSV and plot."""
+        preferred = ["XGB", "GBR", "SARIMA", "SARIMAX"]
+        model_order = [m for m in preferred if m in preds] + [m for m in preds if m not in preferred]
 
-    def _init_network(self, n_features: int) -> None:
-        self.input_proj = nn.Linear(n_features, self.embed_dim).to(self.device)
-        self.pos_enc = PositionalEncoding(self.embed_dim, max_len=max(20000, self.lookback + 1)).to(self.device)
-        enc_layer = nn.TransformerEncoderLayer(
-            d_model=self.embed_dim, nhead=self.nhead, dim_feedforward=self.ff_dim,
-            dropout=self.dropout, batch_first=True, activation="gelu", norm_first=True
-        )
-        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=self.num_layers).to(self.device)
-        self.final_norm = nn.LayerNorm(self.embed_dim).to(self.device)
-        self.output_proj = nn.Linear(self.embed_dim, 1).to(self.device)
+        aligned = {name: preds[name].reindex(y_true.index) for name in model_order}
 
-    # EMA helpers
-    @torch.no_grad()
-    def _ema_init_from_current(self) -> None:
-        self._ema_state = {k: v.detach().clone().cpu() for k, v in self.state_dict().items()}
+        out_df = pd.DataFrame(index=y_true.index)
+        for name in model_order:
+            out_df[name] = aligned[name].astype(float).values
+        out_df["Observed"] = y_true.astype(float).values
 
-    @torch.no_grad()
-    def _ema_update(self) -> None:
-        if self._ema_state is None:
-            self._ema_init_from_current()
-            return
-        d = self.state_dict()
-        for k, v in d.items():
-            v_cpu = v.detach().cpu()
-            self._ema_state[k].mul_(self.ema_decay).add_(v_cpu, alpha=1.0 - self.ema_decay)
+        csv_path = RESULTS_DIR / f"forecasts_h{horizon_hours}_hours.csv"
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+        out_df.to_csv(csv_path, index_label="timestamp", float_format="%.6f")
 
-    def _load_state(self, state: dict[str, torch.Tensor]) -> None:
-        self.load_state_dict({k: v.to(self.device) for k, v in state.items()}, strict=True)
+        plt.figure(figsize=(12, 4))
+        plt.plot(y_true.index, y_true.values, label="Observed", linewidth=2, color="black")
+        for name in model_order:
+            series = aligned[name]
+            plt.plot(series.index, series.values, label=name, alpha=0.9)
+        plt.title(f"Forecasts (last fold) – horizon={horizon_hours}h")
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(RESULTS_DIR / f"plot_h{horizon_hours}_hours.png", dpi=120)
+        plt.close()
+
+        return csv_path
 
     @staticmethod
-    def _avg_states(states: List[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
-        out: dict[str, torch.Tensor] = {}
-        for k in states[0].keys():
-            s = None
-            for st in states:
-                t = st[k]
-                s = t.clone() if s is None else s.add_(t)
-            out[k] = s.div_(len(states))
-        return out
+    def run_walkforward_multi_horizon(
+        models: Dict[str, BaseEstimator],
+        features_dataframe: pd.DataFrame,
+        target_column: str,
+        sarima_dataset: pd.DataFrame,
+        sarimax_dataset: Optional[pd.DataFrame],
+        horizons_hours: List[int],
+        global_context: RunContext,
+    ) -> pd.DataFrame:
+        """Loop over horizons, run CV per model, save per-horizon outputs and collect ranking rows."""
+        for h in horizons_hours:
+            print(f"\n=== Walk-forward for horizon {h} hours ===")
+            local_ctx = RunContext()
 
-    def _maybe_push_snapshot(self, mae_val: float, state: dict[str, torch.Tensor]) -> None:
-        self._snapshots.append((mae_val, {k: v.detach().clone().cpu() for k, v in state.items()}))
-        self._snapshots.sort(key=lambda x: x[0])
-        if len(self._snapshots) > self.snapshot_top_k:
-            self._snapshots = self._snapshots[:self.snapshot_top_k]
-
-    # forward core
-    def _forward_core(self, xb: torch.Tensor, hb: Optional[torch.Tensor] = None, db: Optional[torch.Tensor] = None) -> torch.Tensor:
-        z = self.input_proj(xb)
-        if (hb is not None) and (db is not None):
-            hb = hb.to(self.device, non_blocking=True).long()
-            db = db.to(self.device, non_blocking=True).long()
-            he = self.hour_emb(hb)
-            de = self.dow_emb(db)
-            z = torch.cat([z, he, de], dim=-1)
-            z = self.time_proj(z)
-        z = self.pos_enc(z)
-        mask = self._causal_mask_cpu.to(self.device)
-        z = self.encoder(z, mask=mask)
-        z = z[:, -1, :] if self.aggregation == "last" else z.mean(dim=1)
-        z = self.final_norm(z)
-        out = self.output_proj(z)
-        return out
-
-    # ---- fit/predict ----
-    def fit(self, X_df: pd.DataFrame, y_ser: pd.Series) -> "SeqTransformerRegressor":
-        if X_df.isna().any().any():
-            raise ValueError("NaN in X")
-        if y_ser.isna().any():
-            raise ValueError("NaN in y")
-
-        index = X_df.index
-        y_log = signed_log1p(y_ser.values.astype(np.float32)).reshape(-1, 1)
-        self.scaler_y = StandardScaler().fit(y_log)
-        y_scaled = self.scaler_y.transform(y_log).astype(np.float32)
-
-        self.scaler_X = StandardScaler().fit(X_df.values)
-        X_scaled = self.scaler_X.transform(X_df.values).astype(np.float32)
-
-        X_win, y_win = self._build_windows(X_scaled, y_scaled)
-
-        hours_all, dows_all = self._time_indices(index)
-        h_win = np.lib.stride_tricks.sliding_window_view(hours_all, window_shape=self.lookback).astype(np.int64)
-        d_win = np.lib.stride_tricks.sliding_window_view(dows_all,  window_shape=self.lookback).astype(np.int64)
-
-        M = X_win.shape[0]
-        val_len = max(1, int(0.1 * M))
-        X_tr, y_tr = X_win[:-val_len], y_win[:-val_len]
-        X_val, y_val = X_win[-val_len:], y_win[-val_len:]
-        h_tr, d_tr = h_win[:-val_len], d_win[:-val_len]
-        h_val, d_val = h_win[-val_len:], d_win[-val_len:]
-
-        self._init_network(X_scaled.shape[1])
-
-        if self.use_ema:
-            self._ema_init_from_current()
-
-        train_loader = DataLoader(
-            TensorDataset(torch.from_numpy(X_tr), torch.from_numpy(y_tr),
-                          torch.from_numpy(h_tr), torch.from_numpy(d_tr)),
-            batch_size=self.batch_size, shuffle=False, num_workers=2, pin_memory=True, persistent_workers=False
-        )
-        val_loader = DataLoader(
-            TensorDataset(torch.from_numpy(X_val), torch.from_numpy(y_val),
-                          torch.from_numpy(h_val), torch.from_numpy(d_val)),
-            batch_size=self.batch_size, shuffle=False, num_workers=2, pin_memory=True, persistent_workers=False
-        )
-
-        optimizer = optim.AdamW(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
-        loss_fn = nn.L1Loss()
-        steps_per_epoch = max(1, math.ceil(len(X_tr) / self.batch_size))
-        scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            optimizer, max_lr=self.lr, epochs=self.epochs, steps_per_epoch=steps_per_epoch,
-            pct_start=0.1, div_factor=10.0, final_div_factor=10.0
-        )
-        scaler = torch.cuda.amp.GradScaler(enabled=self.amp and self.device.type == "cuda")
-
-        best_state = {k: v.cpu() for k, v in self.state_dict().items()}
-        patience_left = self.patience
-        self._epochs_run = 0
-        self._best_epoch = 0
-        self._best_val_mae_orig = float("inf")
-
-        print(f"[TRAIN] device={self.device} | lookback={self.lookback} | epochs={self.epochs}")
-
-        for epoch in range(1, self.epochs + 1):
-            self.train()
-            train_losses: List[float] = []
-
-            for xb, yb, hb, db in train_loader:
-                xb = xb.to(self.device, non_blocking=True)
-                yb = yb.to(self.device, non_blocking=True)
-                hb = hb.to(self.device, non_blocking=True).long()
-                db = db.to(self.device, non_blocking=True).long()
-
-                if self.feature_noise_std > 0.0:
-                    xb = xb + torch.randn_like(xb) * self.feature_noise_std
-
-                optimizer.zero_grad(set_to_none=True)
-                with torch.cuda.amp.autocast(enabled=self.amp and self.device.type == "cuda"):
-                    preds = self._forward_core(xb, hb, db)
-                    loss = loss_fn(preds, yb)
-
-                if scaler.is_enabled():
-                    scaler.scale(loss).backward()
-                    torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
-                    scaler.step(optimizer); scaler.update(); scheduler.step()
+            for name, model_obj in models.items():
+                if name == "SARIMAX":
+                    input_df = sarimax_dataset
+                elif name == "SARIMA":
+                    input_df = sarima_dataset
                 else:
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
-                    optimizer.step(); scheduler.step()
+                    input_df = features_dataframe
 
-                if self.use_ema:
-                    self._ema_update()
-                train_losses.append(float(loss.detach().item()))
+                AnalysisTools.validate_time_series_model(
+                    input_df=input_df,
+                    target_column=target_column,
+                    model_obj=model_obj,
+                    test_horizon=h,
+                    n_splits=DEFAULT_N_SPLITS,
+                    model_name=name,
+                    run_context=local_ctx,
+                )
 
-            # Validation (optionally with EMA weights)
-            self.eval()
-            saved_state = None
-            if self.use_ema and (self._ema_state is not None):
-                saved_state = {k: v.detach().cpu() for k, v in self.state_dict().items()}
-                self._load_state(self._ema_state)
+            if local_ctx.preds_by_model:
+                y_true_last = features_dataframe[target_column].tail(h).astype(float)
+                idx_common = y_true_last.index
+                for ser in local_ctx.preds_by_model.values():
+                    idx_common = idx_common.intersection(ser.index)
+                if len(idx_common) == 0:
+                    idx_common = y_true_last.index
+                y_true_last = y_true_last.loc[idx_common]
+                preds_dict = {n: s.reindex(idx_common) for n, s in local_ctx.preds_by_model.items()}
 
-            val_losses, val_preds_scaled = [], []
-            with torch.no_grad():
-                for xb, yb, hb, db in val_loader:
-                    xb = xb.to(self.device, non_blocking=True)
-                    yb = yb.to(self.device, non_blocking=True)
-                    hb = hb.to(self.device, non_blocking=True).long()
-                    db = db.to(self.device, non_blocking=True).long()
-                    with torch.cuda.amp.autocast(enabled=self.amp and self.device.type == "cuda"):
-                        preds = self._forward_core(xb, hb, db)
-                        loss = loss_fn(preds, yb)
-                    val_losses.append(float(loss.detach().item()))
-                    val_preds_scaled.append(preds.detach().cpu().numpy())
+                csv_path = AnalysisTools.save_horizon_outputs(h, y_true=y_true_last, preds=preds_dict)
+                print(f"[INFO] Saved horizon outputs -> {csv_path}")
 
-            if saved_state is not None:
-                self._load_state(saved_state)
+            for rec in local_ctx.all_results:
+                global_context.all_results.append(rec)
 
-            # Early stopping on MAE in original scale
-            y_val_scaled = y_val.reshape(-1, 1)
-            y_pred_scaled = np.vstack(val_preds_scaled)
-            y_val_log = self.scaler_y.inverse_transform(y_val_scaled).ravel()
-            y_pred_log = self.scaler_y.inverse_transform(y_pred_scaled).ravel()
-            y_val_orig = inv_signed_log1p(y_val_log)
-            y_pred_orig = inv_signed_log1p(y_pred_log)
-            mae_val_orig = float(np.mean(np.abs(y_val_orig - y_pred_orig)))
+            for m in models.values():
+                try:
+                    if hasattr(m, "model_") and m.model_ is not None:
+                        try:
+                            if hasattr(m.model_, "remove_data"):
+                                m.model_.remove_data()
+                        except Exception:
+                            pass
+                        m.model_ = None
+                    if hasattr(m, "fallback_mean_value"):
+                        m.fallback_mean_value = None
+                    if hasattr(m, "use_fallback"):
+                        m.use_fallback = False
+                except Exception:
+                    pass
+            gc.collect()
 
-            self._epochs_run = epoch
-            if math.isfinite(mae_val_orig) and mae_val_orig < self._best_val_mae_orig - 1e-9:
-                self._best_val_mae_orig = mae_val_orig
-                self._best_epoch = epoch
-                if self.use_ema and (self._ema_state is not None):
-                    best_state = {k: v.clone() for k, v in self._ema_state.items()}
-                else:
-                    best_state = {k: v.detach().cpu() for k, v in self.state_dict().items()}
-                patience_left = self.patience
-                self._maybe_push_snapshot(mae_val_orig, best_state)
-            else:
-                patience_left -= 1
-                if patience_left == 0:
-                    print("[EARLY STOP] No improvement.")
-                    break
+        return pd.DataFrame()
 
-            if epoch == 1 or epoch % 5 == 0:
-                print(f"[EPOCH {epoch}/{self.epochs}] "
-                      f"train_loss={np.mean(train_losses):.4f}  "
-                      f"val_loss={np.mean(val_losses):.4f}  "
-                      f"val_MAE_orig={mae_val_orig:.3f}")
-
-        final_state = best_state
-        if len(self._snapshots) >= 2:
-            final_state = self._avg_states([st for _, st in self._snapshots])
-
-        self._load_state(final_state)
-        self.eval()
-        self.fitted = True
-        print(f"[TRAIN] done. epochs_run={self._epochs_run} | "
-              f"best_val_MAE_orig={self._best_val_mae_orig:.3f} @epoch={self._best_epoch}")
-        return self
-
-    def predict(self, X_df: pd.DataFrame) -> pd.Series:
-        if not self.fitted:
-            raise RuntimeError("Call fit() first")
-
-        X_scaled = self.scaler_X.transform(X_df.values).astype(np.float32)
-        N, L = X_scaled.shape[0], self.lookback
-        if N < L:
-            return pd.Series([np.nan] * N, index=X_df.index)
-
-        X_win = np.lib.stride_tricks.sliding_window_view(X_scaled, window_shape=(L, X_scaled.shape[1]))
-        X_win = X_win.reshape(-1, L, X_scaled.shape[1])
-
-        hours_all = X_df.index.hour.values.astype(np.int64)
-        dows_all = X_df.index.dayofweek.values.astype(np.int64)
-        h_win = np.lib.stride_tricks.sliding_window_view(hours_all, window_shape=L).astype(np.int64)
-        d_win = np.lib.stride_tricks.sliding_window_view(dows_all,  window_shape=L).astype(np.int64)
-
-        xb = torch.from_numpy(X_win).to(self.device)
-        hb = torch.from_numpy(h_win).long().to(self.device)
-        db = torch.from_numpy(d_win).long().to(self.device)
-
-        preds_scaled: List[np.ndarray] = []
-        with torch.no_grad():
-            saved_training = self.training
-            if self.mc_dropout_passes > 1:
-                self.train()
-            else:
-                self.eval()
-
-            mask = self._causal_mask_cpu.to(self.device)
-            for i in range(0, xb.size(0), self.batch_size):
-                chunk_x = xb[i:i + self.batch_size]
-                chunk_h = hb[i:i + self.batch_size]
-                chunk_d = db[i:i + self.batch_size]
-                with torch.cuda.amp.autocast(enabled=self.amp and self.device.type == "cuda"):
-                    z = self.input_proj(chunk_x)
-                    z = torch.cat([z, self.hour_emb(chunk_h), self.dow_emb(chunk_d)], dim=-1)
-                    z = self.time_proj(z)
-                    z = self.pos_enc(z)
-                    z = self.encoder(z, mask=mask)
-                    z = z[:, -1, :] if self.aggregation == "last" else z.mean(dim=1)
-                    z = self.final_norm(z)
-                    out = self.output_proj(z).squeeze(-1).detach().cpu().numpy()
-                preds_scaled.append(out)
-
-            if saved_training:
-                self.train()
-            else:
-                self.eval()
-
-        y_scaled = np.concatenate(preds_scaled, axis=0)
-        y_log = self.scaler_y.inverse_transform(y_scaled.reshape(-1, 1)).ravel()
-        y_hat = inv_signed_log1p(y_log).astype(np.float32)
-
-        full = np.full(N, np.nan, dtype=np.float32)
-        full[L - 1:] = y_hat
-        return pd.Series(full, index=X_df.index)
-
-
-# Feature Importance
+# ========================= FEATURE IMPORTANCE =========================
 
 class FeatureImportance:
-    """Permutation feature importance for time series with lookback context."""
-
     @staticmethod
-    def permutation_last_h(
-        model: SeqTransformerRegressor,
-        X_tr: pd.DataFrame,
-        X_te: pd.DataFrame,
-        y_te: pd.Series,
-        metric_fn = Metrics.mae,
-        n_repeats: int = 3,
-        top_k: int = 20
+    def permutation_importance_csv(
+        fitted_estimator,
+        features_dataframe: pd.DataFrame,
+        target_column: str,
+        top_n: int,
+        save_csv_path: Path,
+        save_plot_path: Optional[Path] = None,
+        window_hours: int = 24 * 7,
+        n_repeats: int = 10,
+        random_seed: int = 42,
     ) -> pd.DataFrame:
         """
-        Compute permutation importance by permuting ONLY the test region.
-        The 'context' (tail of training needed for the first test prediction) is kept intact.
+        Permutation importance measured as ΔMAE on the last `window_hours`.
+        Works for sklearn models and for SarimaX (uses its exogenous_columns if set).
         """
-        lookback = getattr(model, "lookback", 1)
-        X_ctx = pd.concat([X_tr.tail(max(0, lookback - 1)), X_te], axis=0)
+        rng = np.random.default_rng(random_seed)
+        h = int(np.clip(window_hours, 24, max(24, len(features_dataframe) - 1)))
 
-        y_pred_base = model.predict(X_ctx).loc[X_te.index]
-        base_err = metric_fn(y_te, y_pred_base)
+        train_df = features_dataframe.iloc[:-h]
+        val_df = features_dataframe.iloc[-h:]
 
-        importances: List[Tuple[str, float]] = []
-        feat_cols = list(X_te.columns)
+        X_tr = (
+            train_df.drop(columns=[target_column])
+            .select_dtypes(include=[np.number])
+            .loc[:, lambda d: ~d.columns.duplicated()]
+        )
+        y_tr = train_df[target_column].astype(float)
 
-        test_index = X_te.index
-        ctx_index = X_ctx.index
-        test_mask = ctx_index.isin(test_index)
+        X_val_full = (
+            val_df.drop(columns=[target_column])
+            .select_dtypes(include=[np.number])
+            .loc[:, lambda d: ~d.columns.duplicated()]
+            .copy()
+        )
+        y_val = val_df[target_column].astype(float)
 
-        for col in feat_cols:
-            deltas = []
+        # Restrict to SARIMAX exog, if applicable
+        if isinstance(fitted_estimator, SarimaX) and fitted_estimator.exogenous_columns:
+            cols = [c for c in fitted_estimator.exogenous_columns if c in X_val_full.columns]
+            X_val = X_val_full.loc[:, cols].copy()
+        else:
+            X_val = X_val_full
+
+        # Fit a fresh copy if possible
+        try:
+            est = fitted_estimator.__class__(**{k: v for k, v in fitted_estimator.__dict__.items()
+                                                if not k.endswith("_")})
+            est.fit(X_tr, y_tr)
+        except Exception:
+            est = fitted_estimator
+
+        base_pred = est.predict(X_val)
+        base_mae = mean_absolute_error(y_val, base_pred)
+
+        rows: List[tuple[str, float]] = []
+        for col in list(X_val.columns):
+            scores = []
             for _ in range(n_repeats):
-                X_perm = X_ctx.copy()
-                shuffled = X_perm.loc[test_mask, col].sample(frac=1.0, replace=False).values
-                X_perm.loc[test_mask, col] = shuffled
-                y_pred_perm = model.predict(X_perm).loc[X_te.index]
-                err = metric_fn(y_te, y_pred_perm)
-                deltas.append(err - base_err)
-            importances.append((col, float(np.mean(deltas))))
+                Xp = X_val.copy()
+                Xp[col] = rng.permutation(Xp[col].values)
+                yp = est.predict(Xp)
+                scores.append(mean_absolute_error(y_val, yp))
+            rows.append((col, float(np.mean(scores) - base_mae)))
 
-        imp_df = (pd.DataFrame(importances, columns=["feature", "delta_mae"])
-                    .sort_values("delta_mae", ascending=False)
-                    .reset_index(drop=True))
+        df = (
+            pd.DataFrame(rows, columns=["feature", "importance"])
+            .sort_values("importance", ascending=False)
+            .head(top_n)
+            .reset_index(drop=True)
+        )
 
-        print(f"\n[Permutation importance] TOP {top_k}:")
-        for i, row in imp_df.head(top_k).iterrows():
-            print(f" #{i+1:02d} {row['feature']}: ΔMAE=+{row['delta_mae']:.4f}")
-        return imp_df
+        save_csv_path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(save_csv_path, index=False)
 
+        if save_plot_path is not None:
+            plt.figure(figsize=(10, max(4, 0.35 * len(df) + 1)))
+            plt.barh(df["feature"][::-1], df["importance"][::-1])
+            plt.xlabel("Permutation importance (ΔMAE)")
+            plt.title(f"TOP-{top_n} permutation importance")
+            plt.tight_layout()
+            plt.savefig(save_plot_path, dpi=120)
+            plt.close()
 
-# Optuna Tuner (CV)
-
-class OptunaTuner:
-    """Optuna-based hyperparameter tuner using TimeSeriesSplit CV."""
-
-    @staticmethod
-    def _cv_mae_for_cfg(
-        df: pd.DataFrame,
-        target_col: str,
-        cfg: dict,
-        test_horizon: int,
-        n_splits: int,
-        seed: int = 42
-    ) -> float:
-        set_global_seed(seed)
-        tscv = TimeSeriesSplit(n_splits=n_splits, test_size=test_horizon)
-        maes: List[float] = []
-
-        for fold, (tr_idx, te_idx) in enumerate(tscv.split(df), start=1):
-            train_df = df.iloc[tr_idx]
-            test_df = df.iloc[te_idx]
-            X_tr, y_tr = train_df.drop(columns=[target_col]), train_df[target_col]
-            X_te, y_te = test_df.drop(columns=[target_col]), test_df[target_col]
-
-            model = SeqTransformerRegressor(**cfg)
-            # lightweight training for tuning
-            model.use_ema = False
-            model.feature_noise_std = 0.0
-            model.snapshot_top_k = 1
-            model.mc_dropout_passes = 1
-
-            model.fit(X_tr, y_tr)
-            L = model.lookback
-            X_ctx = pd.concat([X_tr.tail(max(0, L - 1)), X_te], axis=0)
-            y_pred = model.predict(X_ctx).loc[y_te.index]
-            mae = Metrics.mae(y_te, y_pred)
-            maes.append(mae)
-            print(f"[CV] fold={fold} MAE={mae:.3f}")
-
-        return float(np.nanmean(maes))
+        print(f"[INFO] Saved permutation importance -> {save_csv_path}")
+        return df
 
     @staticmethod
-    def tune(
-        df: pd.DataFrame,
-        target_col: str,
-        trials: int,
-        horizon: int,
-        splits: int,
-        results_dir: Path,
-        seed: int = 42
-    ) -> dict:
-        if not _optuna_available():
-            raise RuntimeError("Optuna is not installed.")
+    def plot_permutation_importance(
+        model_obj,
+        features_dataframe: pd.DataFrame,
+        target_column: str,
+        top_n_features: int = 20,
+        n_repeats: int = 10,
+        random_seed: int = 42,
+    ) -> None:
+        """
+        Quick visual-only permutation importance on the whole table (ΔMAE).
+        For consistent CSV outputs, prefer `permutation_importance_csv`.
+        """
+        rng = np.random.default_rng(random_seed)
+        X = features_dataframe.drop(columns=[target_column]).select_dtypes(include=[np.number])
+        y = features_dataframe[target_column].astype(float)
 
-        import optuna
-        from optuna.pruners import SuccessiveHalvingPruner
+        # fit a fresh copy to avoid overwriting
+        try:
+            est = model_obj.__class__(**{k: v for k, v in model_obj.__dict__.items() if not k.endswith("_")})
+            est.fit(X, y)
+        except Exception:
+            est = model_obj
 
-        print(f"[Optuna] CV tuning: trials={trials}, horizon={horizon}, splits={splits}")
+        base_pred = est.predict(X)
+        base_mae = mean_absolute_error(y, base_pred)
 
-        def objective(trial: "optuna.trial.Trial") -> float:
-            cfg = dict(
-                embed_dim     = trial.suggest_categorical("embed_dim", [128, 192, 256]),
-                nhead         = trial.suggest_categorical("nhead", [4, 8]),
-                num_layers    = trial.suggest_int("num_layers", 3, 7),
-                ff_dim        = trial.suggest_categorical("ff_dim", [384, 512, 768]),
-                dropout       = trial.suggest_float("dropout", 0.05, 0.25),
-                batch_size    = trial.suggest_categorical("batch_size", [24, 32, 48]),
-                epochs        = 130,
-                lr            = trial.suggest_float("lr", 1e-5, 1e-3, log=True),
-                weight_decay  = trial.suggest_float("weight_decay", 1e-6, 3e-4, log=True),
-                lookback      = trial.suggest_categorical("lookback", [336]),
-                patience      = 20,
-                aggregation   = "last",
-                amp           = True,
+        rows = []
+        for col in list(X.columns):
+            scores = []
+            for _ in range(n_repeats):
+                Xp = X.copy()
+                Xp[col] = rng.permutation(Xp[col].values)
+                yp = est.predict(Xp)
+                scores.append(mean_absolute_error(y, yp))
+            rows.append((col, float(np.mean(scores) - base_mae)))
+
+        df = (
+            pd.DataFrame(rows, columns=["feature", "importance"])
+            .sort_values("importance", ascending=False)
+            .head(top_n_features)
+        )
+
+        plt.figure(figsize=(10, max(4, 0.35 * len(df) + 1)))
+        plt.barh(df["feature"][::-1], df["importance"][::-1])
+        plt.xlabel("Permutation importance (ΔMAE)")
+        plt.title("Permutation importance")
+        plt.tight_layout()
+        plt.show()
+
+# ========================= MODELS =========================
+
+class SarimaX(BaseEstimator, RegressorMixin):
+    """SARIMA/SARIMAX wrapper with safe fallback (mean) and optional truncation for long series."""
+    def __init__(self,
+                 exogenous_columns: Optional[List[str]] = None,
+                 order: Tuple[int, int, int] = (1, 0, 2),
+                 seasonal_order: Tuple[int, int, int, int] = (1, 1, 1, 24),
+                 maximum_observations: Optional[int] = None):
+        self.exogenous_columns = exogenous_columns
+        self.order = order
+        self.seasonal_order = seasonal_order
+        self.maximum_observations = maximum_observations
+        self.model_ = None
+        self.use_fallback = False
+        self.fallback_mean_value = None
+
+
+    def select_exogenous_columns(features_dataframe: pd.DataFrame, target_column: str,
+                                 blacklist: Optional[List[str] | set[str]] = None, ) -> List[str]:
+        """Select numeric columns except the target as exogenous features (with optional blacklist)."""
+        if features_dataframe.empty:
+            return []
+        cols = (
+            features_dataframe.drop(columns=[target_column], errors="ignore")
+            .select_dtypes(include=[np.number])
+            .loc[:, lambda d: ~d.columns.duplicated()]
+            .columns.tolist()
+        )
+
+        if blacklist:
+            bl = set(map(str, blacklist))
+            before = set(cols)
+            cols = [c for c in cols if c not in bl]
+            dropped = sorted(before - set(cols))
+            if dropped:
+                print(f"[EXOG] Dropped by blacklist ({len(dropped)}): {dropped}")
+        print(f"[EXOG] Using {len(cols)} exogenous columns.")
+        return cols
+
+    def fit(self, X: pd.DataFrame, y: pd.Series):
+        if self.maximum_observations is not None and len(y) > self.maximum_observations:
+            y = y.tail(self.maximum_observations)
+            X = X.tail(self.maximum_observations)
+
+        exog = X[self.exogenous_columns] if self.exogenous_columns else None
+
+        if len(y) < 2 * self.seasonal_order[3]:
+            self.fallback_mean_value = y.tail(24).mean()
+            if np.isnan(self.fallback_mean_value):
+                self.fallback_mean_value = y.mean()
+            self.use_fallback = True
+            print("SARIMA fallback: too little data, using 24h mean")
+            return self
+
+        try:
+            self.model_ = SARIMAX(
+                y, exog=exog, order=self.order, seasonal_order=self.seasonal_order,
+                enforce_stationarity=False, enforce_invertibility=False,
+            ).fit(disp=False)
+            print("SARIMA fitted successfully")
+        except Exception as e:
+            self.fallback_mean_value = y.tail(24).mean()
+            if np.isnan(self.fallback_mean_value):
+                self.fallback_mean_value = y.mean()
+            self.use_fallback = True
+            print(f"SARIMA fallback due to exception: {str(e)} - using 24h mean")
+        return self
+
+    def predict(self, X: pd.DataFrame):
+        steps = len(X)
+        if self.use_fallback or self.model_ is None:
+            return pd.Series(np.full(steps, self.fallback_mean_value), index=X.index)
+        exog = X[self.exogenous_columns] if self.exogenous_columns else None
+        fc = self.model_.forecast(steps=steps, exog=exog)
+        return pd.Series(fc.values, index=X.index)
+class GradientBoostingModel(BaseEstimator, RegressorMixin):
+    """GradientBoostingRegressor with ES or RS modes."""
+    def __init__(self,
+                 mode: str = "es",
+                 n_iter_rs: int = 20,
+                 cross_validation_splits: int = 5,
+                 max_boosting_rounds: int = 1500,
+                 validation_fraction: float = 0.1,
+                 random_seed: int = 42,
+                 learning_rate: float = 0.015,
+                 maximum_tree_depth: int = 4,
+                 subsample_ratio: float = 0.8,
+                 minimum_samples_per_leaf: int = 15):
+        self.mode = mode
+        self.n_iter_rs = n_iter_rs
+        self.max_boosting_rounds = max_boosting_rounds
+        self.cross_validation_splits = cross_validation_splits
+        self.validation_fraction = validation_fraction
+        self.random_seed = random_seed
+        self.learning_rate = learning_rate
+        self.maximum_tree_depth = maximum_tree_depth
+        self.subsample_ratio = subsample_ratio
+        self.minimum_samples_per_leaf = minimum_samples_per_leaf
+        self.model_ = None
+
+    def fit(self, X: pd.DataFrame, y: pd.Series):
+        if X.shape[1] == 0:
+            raise ValueError("GBR has 0 columns")
+        if X.shape[0] == 0:
+            raise ValueError("GBR has 0 rows")
+
+        if self.mode == "es":
+            split = int(len(X) * (1 - self.validation_fraction))
+            X_tr, X_va = X.iloc[:split], X.iloc[split:]
+            y_tr, y_va = y.iloc[:split], y.iloc[split:]
+
+            tmp = GradientBoostingRegressor(
+                n_estimators=self.max_boosting_rounds,
+                learning_rate=self.learning_rate,
+                max_depth=self.maximum_tree_depth,
+                subsample=self.subsample_ratio,
+                min_samples_leaf=self.minimum_samples_per_leaf,
+                random_state=self.random_seed,
+            ).fit(X_tr, y_tr)
+
+            mae_val = [mean_absolute_error(y_va, p) for p in tmp.staged_predict(X_va)]
+            best_iter = int(np.argmin(mae_val) + 1)
+            print(f"GBR: best trees = {best_iter} (MAE val = {mae_val[best_iter-1]:.2f})")
+
+            self.model_ = GradientBoostingRegressor(
+                n_estimators=best_iter,
+                learning_rate=self.learning_rate,
+                max_depth=self.maximum_tree_depth,
+                subsample=self.subsample_ratio,
+                min_samples_leaf=self.minimum_samples_per_leaf,
+                random_state=self.random_seed,
+            ).fit(X, y)
+        else:
+            param_grid = {
+                "n_estimators": [1300, 1700, 2600],
+                "learning_rate": [0.01, 0.02, 0.03, 0.04, 0.05],
+                "max_depth": [3, 4, 6, 7, 8],
+                "subsample": [0.7, 0.8, 1.0],
+            }
+            base = GradientBoostingRegressor(min_samples_leaf=self.minimum_samples_per_leaf, random_state=self.random_seed)
+            tscv = TimeSeriesSplit(n_splits=self.cross_validation_splits, test_size=DEFAULT_TEST_HORIZON)
+            rs = RandomizedSearchCV(base, param_grid, n_iter=self.n_iter_rs, scoring="neg_mean_absolute_error", cv=tscv, n_jobs=8, verbose=0).fit(X, y)
+            print("GBR_RS: best params:", rs.best_params_)
+            self.model_ = rs.best_estimator_
+        return self
+
+    def predict(self, X: pd.DataFrame):
+        return self.model_.predict(X)
+class XGBoostModel(BaseEstimator, RegressorMixin):
+    """XGBRegressor with ES (Early stop) via xgb.cv or RS (Random Search)."""
+    def __init__(self,
+                 mode: str = "es",
+                 n_iter_rs: int = 250,
+                 cross_validation_splits: int = 5,
+                 early_stopping_folds: int = 3,
+                 max_boosting_rounds: int = 5000,
+                 early_stopping_rounds: int = 50,
+                 random_seed: int = 42):
+        self.mode = mode
+        self.n_iter_rs = n_iter_rs
+        self.cross_validation_splits = cross_validation_splits
+        self.early_stopping_folds = early_stopping_folds
+        self.max_boosting_rounds = max_boosting_rounds
+        self.early_stopping_rounds = early_stopping_rounds
+        self.random_seed = random_seed
+        self.model_ = None
+
+    def fit(self, X: pd.DataFrame, y: pd.Series):
+        if self.mode == "es":
+            dmatrix = xgb.DMatrix(X, label=y)
+            params = dict(
+                objective="reg:squarederror",
+                learning_rate=0.04,
+                max_depth=7,
+                subsample=0.7,
+                colsample_bytree=0.6,
+                eval_metric="mae",
+                seed=self.random_seed,
             )
-            print(f"[Optuna][trial {trial.number}] cfg={cfg}")
-            mae = OptunaTuner._cv_mae_for_cfg(df, target_col, cfg, horizon, splits, seed)
-            trial.set_user_attr("cfg", cfg)
-            return mae
-
-        study = optuna.create_study(
-            direction="minimize",
-            pruner=SuccessiveHalvingPruner(min_resource=20, reduction_factor=3),
-        )
-        study.optimize(objective, n_trials=trials, show_progress_bar=False)
-
-        best_cfg = study.best_trial.user_attrs["cfg"]
-        print("[Optuna] Best MAE:", study.best_value)
-        print("[Optuna] Best config:\n" + json.dumps(best_cfg, indent=2))
-        (results_dir / "best_optuna_config.json").write_text(json.dumps(best_cfg, indent=2), encoding="utf-8")
-        return best_cfg
-
-
-# Config Factory
-
-class ConfigFactory:
-    """Select a good starting config based on dataset name."""
-    @staticmethod
-    def pick_for_data(data_uri: str) -> dict:
-        name = os.path.basename(str(data_uri)).upper()
-        if "CLIPOFF" in name:
-            print("[CFG] Detected dataset=CLIPOFF -> using TUNED_CFG")
-            return TUNED_CFG.copy()
-        print("[CFG] Dataset not recognized -> using BEST_CFG")
-        return BEST_CFG.copy()
-
-
-# Pipeline
-
-class ForecasterPipeline:
-    """End-to-end training → importance → refit → forecast exporter."""
-
-    def __init__(self, run_cfg: RunConfig, target_col: str = TARGET_COLUMN) -> None:
-        self.run_cfg = run_cfg
-        self.target_col = target_col
-        self.data = DataModule(target_col=target_col)
-
-    def run(self) -> None:
-        set_global_seed(self.run_cfg.seed)
-        self.run_cfg.ensure_dirs()
-
-        # 1) Load & enrich data
-        df = self.data.load_dataframe(self.run_cfg.data_path)
-        df = self.data.ensure_calendar_features(df)
-
-        print("[DATA] shape =", df.shape)
-        print("[DATA] head columns =", list(df.columns)[:10], "..." if df.shape[1] > 10 else "")
-
-        assert df[self.target_col].notna().all(), "TARGET contains NaN"
-        na_cols = [c for c in df.columns if df[c].isna().any()]
-        assert not na_cols, f"NaN in columns: {na_cols[:5]}"
-
-        # 2) Config selection: Optuna CV or preset
-        used_tuning = False
-        if self.run_cfg.tune_with_optuna:
-            try:
-                cfg = OptunaTuner.tune(
-                    df=df,
-                    target_col=self.target_col,
-                    trials=self.run_cfg.optuna_trials,
-                    horizon=self.run_cfg.forecast_h,
-                    splits=self.run_cfg.cv_splits,
-                    results_dir=self.run_cfg.results_dir,
-                    seed=self.run_cfg.seed,
-                )
-                used_tuning = True
-            except RuntimeError as e:
-                print(f"[WARN] Optuna tuning skipped ({e}). Falling back to preset.")
-                cfg = ConfigFactory.pick_for_data(self.run_cfg.data_path)
+            cv = xgb.cv(params, dmatrix, num_boost_round=self.max_boosting_rounds, nfold=self.early_stopping_folds,
+                        early_stopping_rounds=self.early_stopping_rounds, metrics="mae", verbose_eval=False)
+            best_iter = len(cv)
+            print(f"XGB: best trees = {best_iter} (MAE cv = {cv['test-mae-mean'].iloc[-1]:.2f})")
+            self.model_ = xgb.XGBRegressor(
+                n_estimators=best_iter,
+                learning_rate=0.03,
+                max_depth=6,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                objective="reg:squarederror",
+                n_jobs=8,
+                random_state=self.random_seed,
+                eval_metric="mae",
+            ).fit(X, y)
         else:
-            cfg = ConfigFactory.pick_for_data(self.run_cfg.data_path)
+            param_grid = {
+                "n_estimators": [1500, 2500, 3500],
+                "learning_rate": [0.03, 0.05, 0.07],
+                "max_depth": [3, 4, 6],
+                "subsample": [0.7, 0.8],
+                "colsample_bytree": [0.6, 0.7, 0.8],
+            }
+            base = xgb.XGBRegressor(objective="reg:squarederror", n_jobs=8, random_state=self.random_seed)
+            tscv = TimeSeriesSplit(n_splits=self.cross_validation_splits, test_size=DEFAULT_TEST_HORIZON)
+            rs = RandomizedSearchCV(base, param_grid, n_iter=self.n_iter_rs, scoring="neg_mean_absolute_error", cv=tscv, n_jobs=8, verbose=0).fit(X, y)
+            print("XGB_RS: best params:", rs.best_params_)
+            self.model_ = rs.best_estimator_
+        return self
 
-        print("[CFG] Using configuration:\n" + json.dumps(cfg, indent=2))
-        (self.run_cfg.results_dir / "training_config_used.json").write_text(
-            json.dumps(cfg, indent=2), encoding="utf-8"
-        )
-
-        # 3) Permutation importance on the LAST H hours (if feasible)
-        h_imp = min(self.run_cfg.forecast_h, len(df) // 3)
-        if h_imp >= cfg["lookback"] + 1:
-            print(f"[IMPORTANCE] Computing on last {h_imp} hours.")
-            train_df = df.iloc[:-h_imp]
-            test_df = df.iloc[-h_imp:]
-            X_tr, y_tr = train_df.drop(columns=[self.target_col]), train_df[self.target_col]
-            X_te, y_te = test_df.drop(columns=[self.target_col]), test_df[self.target_col]
-
-            model_imp = SeqTransformerRegressor(**cfg)
-            # keep importance training light and deterministic
-            model_imp.use_ema = False
-            model_imp.feature_noise_std = 0.0
-            model_imp.snapshot_top_k = 1
-            model_imp.mc_dropout_passes = 1
-
-            model_imp.fit(X_tr, y_tr)
-            try:
-                imp_df = FeatureImportance.permutation_last_h(
-                    model=model_imp,
-                    X_tr=X_tr,
-                    X_te=X_te,
-                    y_te=y_te,
-                    metric_fn=Metrics.mae,
-                    n_repeats=3,
-                    top_k=20
-                )
-                imp_csv = self.run_cfg.results_dir / "perm_importance_lastH_top20.csv"
-                imp_df.to_csv(imp_csv, index=False, float_format="%.6f")
-                print(f"[SAVE] Permutation importance -> {imp_csv.as_posix()}")
-            except Exception as e:
-                print("[WARN] Permutation importance failed:", e)
-        else:
-            print("[IMPORTANCE] Skipped (history shorter than lookback + 1).")
-
-        # 4) Refit on FULL data and forecast next H hours
-        print("[REFIT] Training on the full dataset and forecasting...")
-        X_full, y_full = df.drop(columns=[self.target_col]), df[self.target_col]
-
-        model_full = SeqTransformerRegressor(**cfg)
-        # same light settings as before (adjust if you want EMA on final model)
-        model_full.use_ema = False
-        model_full.feature_noise_std = 0.0
-        model_full.snapshot_top_k = 1
-        model_full.mc_dropout_passes = 1
-
-        model_full.fit(X_full, y_full)
-
-        X_future = self.data.make_future_features_like_train(df, self.run_cfg.forecast_h)
-        X_all = pd.concat([X_full, X_future], axis=0)
-        y_all = model_full.predict(X_all)
-        y_forecast = y_all.loc[X_future.index]
-
-        out = pd.DataFrame({"timestamp": y_forecast.index, "prediction": y_forecast.values})
-        out_path = self.run_cfg.results_dir / f"forecast_h{self.run_cfg.forecast_h}.csv"
-        out.to_csv(out_path, index=False, float_format="%.6f")
-        print(f"[SAVE] {self.run_cfg.forecast_h}h forecast -> {out_path.as_posix()}")
-        print(f"[INFO] Config source: {'optuna(CV)' if used_tuning else 'preset'}")
+    def predict(self, X: pd.DataFrame):
+        return self.model_.predict(X)
 
 
-# CLI
+def build_model_registry(exogenous_cols: Optional[List[str]]):
+    return {
+         "XGB": XGBoostModel(mode="es"),
+         "GBR": GradientBoostingModel(mode="es"),
+        # "GBR_RS": GradientBoostingModel(mode="rs", n_iter_rs=20, cross_validation_splits=5),
+        # "XGB_RS": XGBoostModel(mode="rs", n_iter_rs=50, cross_validation_splits=5),
+         "SARIMA": SarimaX(exogenous_columns=None, order=(1, 1, 1), seasonal_order=(1, 1, 1, 24), maximum_observations=8000),
+         "SARIMAX": SarimaX(exogenous_columns=exogenous_cols, order=(2, 0, 1), seasonal_order=(1, 1, 0, 24), maximum_observations=8000),
+    }
 
-def _bool_env_or_flag(v: str | int | None, default: bool) -> bool:
-    if v is None:
-        return default
-    if isinstance(v, int):
-        return bool(v)
-    v = str(v).strip().lower()
-    if v in {"1", "true", "yes", "y"}:
-        return True
-    if v in {"0", "false", "no", "n"}:
-        return False
-    return default
 
+# ========================= MAIN =========================
 
 def main() -> None:
-    import argparse
+    warnings.filterwarnings("ignore")
 
-    parser = argparse.ArgumentParser(description="Transformer forecasting pipeline (hourly).")
-    parser.add_argument("--data", type=str, default=DEFAULT_DATA, help="Path to Parquet with DatetimeIndex.")
-    parser.add_argument("--h", type=int, default=7 * 24, help="Forecast horizon in hours.")
-    parser.add_argument("--tune", type=str, default=os.getenv("TUNE_WITH_OPTUNA", str(int(TUNE_WITH_OPTUNA_DEFAULT))),
-                        help="Enable Optuna tuning (1/0 or true/false).")
-    parser.add_argument("--trials", type=int, default=int(os.getenv("OPTUNA_TRIALS", OPTUNA_TRIALS_DEFAULT)),
-                        help="Number of Optuna trials.")
-    parser.add_argument("--splits", type=int, default=3, help="CV splits for Optuna tuning.")
-    parser.add_argument("--out", type=str, default="results_transformer", help="Output directory.")
-    args = parser.parse_args()
+    # 1) Load features
+    features_dataframe = load_features_table(FEATURES_FILE)
+    if features_dataframe.empty:
+        print("[STOP] Features table is empty - nothing to evaluate.")
+        return
 
-    run_cfg = RunConfig(
-        data_path=args.data,
-        results_dir=Path(args.out),
-        forecast_h=int(args.h),
-        tune_with_optuna=_bool_env_or_flag(args.tune, TUNE_WITH_OPTUNA_DEFAULT),
-        optuna_trials=int(args.trials),
-        cv_splits=int(args.splits),
-        seed=42,
+    # 2) Exogenous selection (use module-level function if masz; w tej wersji jest w SarimaX)
+    try:
+        exogenous_cols = select_exogenous_columns(  # noqa: F821 if not defined at module level
+            features_dataframe,
+            TARGET_COLUMN,
+            blacklist=DROP_EXOG_FEATURES,
+        )
+    except NameError:
+        # fallback if the function lives in the SarimaX class
+        exogenous_cols = SarimaX.select_exogenous_columns(
+            features_dataframe,
+            TARGET_COLUMN,
+            blacklist=DROP_EXOG_FEATURES,
+        )
+
+    # 3) Model-specific views
+    sarima_dataset = features_dataframe[[TARGET_COLUMN]]
+    sarimax_dataset = features_dataframe[[TARGET_COLUMN] + exogenous_cols] if exogenous_cols else None
+
+    # 4) Registry and context
+    run_context = RunContext()
+    run_context.full_series = features_dataframe[TARGET_COLUMN]
+    models = build_model_registry(exogenous_cols)
+
+    # 5) Walk-forward for multiple horizons
+    AnalysisTools.run_walkforward_multi_horizon(
+        models=models,
+        features_dataframe=features_dataframe,
+        target_column=TARGET_COLUMN,
+        sarima_dataset=sarima_dataset,
+        sarimax_dataset=sarimax_dataset,
+        horizons_hours=HORIZONS_HOURS,
+        global_context=run_context,
     )
 
-    print("[RUN CONFIG]\n" + json.dumps({**asdict(run_cfg), "results_dir": str(run_cfg.results_dir)}, indent=2))
-    ForecasterPipeline(run_cfg).run()
+    # 6) Recursive blocks benchmark
+    AnalysisTools.run_recursive_blocks(
+        models=models,
+        features_dataframe=features_dataframe,
+        target_column=TARGET_COLUMN,
+        sarima_dataset=sarima_dataset,
+        sarimax_dataset=sarimax_dataset,
+        block_hours=24 * 7,
+        n_blocks=10,
+        save_csv_path=RESULTS_DIR / "recursive_blocks_h168x10_ML.csv",
+        run_context=run_context,
+    )
 
+    # 7) Permutation importance snapshots
+    try:
+        if "XGB" in models:
+            FeatureImportance.permutation_importance_csv(
+                fitted_estimator=models["XGB"],
+                features_dataframe=features_dataframe,
+                target_column=TARGET_COLUMN,
+                top_n=20,
+                save_csv_path=RESULTS_DIR / "feature_importance_xgb.csv",
+                save_plot_path=RESULTS_DIR / "plot_feature_importance_xgb.png",
+                window_hours=DEFAULT_TEST_HORIZON,
+            )
+        if "GBR" in models:
+            FeatureImportance.permutation_importance_csv(
+                fitted_estimator=models["GBR"],
+                features_dataframe=features_dataframe,
+                target_column=TARGET_COLUMN,
+                top_n=20,
+                save_csv_path=RESULTS_DIR / "feature_importance_gbr.csv",
+                save_plot_path=RESULTS_DIR / "plot_feature_importance_gbr.png",
+                window_hours=DEFAULT_TEST_HORIZON,
+            )
+        if "SARIMAX" in models and sarimax_dataset is not None:
+            FeatureImportance.permutation_importance_csv(
+                fitted_estimator=models["SARIMAX"],
+                features_dataframe=sarimax_dataset,
+                target_column=TARGET_COLUMN,
+                top_n=20,
+                save_csv_path=RESULTS_DIR / "feature_importance_sarimax.csv",
+                save_plot_path=RESULTS_DIR / "plot_feature_importance_sarimax.png",
+                window_hours=DEFAULT_TEST_HORIZON,
+            )
+    except Exception as ex:
+        print(f"[WARN] Feature importance skipped: {ex}")
+
+    # 8) Summary table (ranking) and last-fold plots
+    if run_context.all_results:
+        df_rank = (
+            pd.DataFrame(run_context.all_results)
+            .sort_values(["HorizonHours", "MAE"])
+            .reset_index(drop=True)
+        )
+        RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+        df_rank.to_csv(RESULTS_DIR / "ranking_models.csv", index=False)
+        print("[SAVE] Ranking ->", RESULTS_DIR / "ranking_models.csv")
+        print(
+            df_rank.to_string(
+                index=False,
+                formatters={
+                    "MAE": "{:.2f}".format,
+                    "RMSE": "{:.2f}".format,
+                    "MAPE": "{:.2f}".format,
+                    "RMSLE": "{:.4f}".format,
+                    "R2": "{:.4f}".format,
+                },
+            )
+        )
+
+    # Plot last fold (all models + per model) if available
+    if run_context.last_fold is not None:
+        y_obs_last, preds_dict = run_context.last_fold
+        full_series = run_context.full_series
+
+        # All models plot
+        plt.figure(figsize=(11, 4))
+        if full_series is not None:
+            plt.plot(full_series.index, full_series.values, color="lightgray", label="Full series")
+        plt.plot(y_obs_last.index, y_obs_last.values, color="black", linewidth=2, label="Observed - last fold")
+        for name, pred in preds_dict.items():
+            plt.plot(pred.index, pred.values, label=name, alpha=0.9)
+        plt.legend()
+        plt.title("Original data and forecasts - last fold")
+        plt.tight_layout()
+        plt.savefig(RESULTS_DIR / "plot_LAST_FOLD_ALL.png", dpi=120)
+        plt.close()
+
+        # Per model plots
+        for name, pred in preds_dict.items():
+            plt.figure(figsize=(11, 4))
+            if full_series is not None:
+                plt.plot(full_series.index, full_series.values, color="lightgray", label="Full series")
+            plt.plot(y_obs_last.index, y_obs_last.values, color="black", linewidth=2, label="Observed - last fold")
+            plt.plot(pred.index, pred.values, label=name, alpha=0.9)
+            plt.legend()
+            plt.title(f"Last fold - {name}")
+            plt.tight_layout()
+            plt.savefig(RESULTS_DIR / f"plot_LAST_FOLD_{name.replace('+', '_')}.png", dpi=120)
+            plt.close()
 
 if __name__ == "__main__":
     main()
