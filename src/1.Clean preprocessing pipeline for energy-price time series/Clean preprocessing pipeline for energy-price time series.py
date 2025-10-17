@@ -156,7 +156,7 @@ def load_dataset(file_path: Union[str, Path], datetime_column: str) -> pd.DataFr
 
 def print_missing_report(df: pd.DataFrame) -> None:
     if df.empty:
-        print("[INFO] Missing report skipped (empty frame).")
+        print("[INFO] Missing report skipped (empty frame)")
         return
     total_rows = len(df)
     missing_count = df.isna().sum()
@@ -588,7 +588,7 @@ def plot_stl_decomposition(df: pd.DataFrame, target_column: str = TARGET_COLUMN,
 # ========================= MAIN FLOW =========================
 
 def main() -> None:
-    # 1) Load (graceful if missing)
+    # 1) Load
     df = load_dataset(RAW_DATABASE_PATH, DATETIME_COLUMN_NAME)
     if df.empty:
         print("No input data. Nothing to preprocess.")
@@ -634,7 +634,7 @@ def main() -> None:
     df = add_distribution_shape_features(df, window_size=24)
     df = add_renewable_share_features(df)
 
-    # Some rolling columns may still start with NaN; forward‑fill them
+    # Some rolling columns may still start with NaN, forward‑fill them
     rolling_cols = [c for c in df.columns if c.startswith(f"{TARGET_COLUMN}_roll")]
     if rolling_cols:
         df[rolling_cols] = df[rolling_cols].ffill()
@@ -647,7 +647,7 @@ def main() -> None:
     print_numeric_summary_table(df)
     print_missing_report(df)
 
-    # 10) Save final table (drop any remaining NaN rows)
+    # 10) Save final table
     before = len(df)
     cleaned = df.dropna(how="any")
     dropped = before - len(cleaned)
@@ -660,3 +660,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
